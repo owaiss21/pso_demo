@@ -1,23 +1,11 @@
-# tracker_core.py
+# tracker_logic.py
 import math
 import numpy as np
 import cv2
-import warnings
-import logging
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional, Tuple, Dict, List
-from ultralytics import YOLO
 
-warnings.filterwarnings("ignore")
-try:
-    from ultralytics.utils import LOGGER
-    LOGGER.setLevel(logging.ERROR)
-    from ultralytics import settings
-    settings.update({"verbose": False})
-except Exception:
-    pass
-
+# --- Classes (shared map) ---
 CLASS_NAMES = {
     0: "Card Machine",
     1: "Cash",
@@ -103,23 +91,31 @@ class Logical:
     vx: float = 0.0
     vy: float = 0.0
 
-class LogicalIDManager:
-    def __init__(self, frame_w, frame_h,
-                 dwell_s=1.5,
-                 max_time_gap_s=1.2,
-                 exit_gap_s=3.0,
-                 suppress_new_in_exit_s=2.0,
+class TrackerLogic:
+    """
+    Pure logic: accepts human detections and returns logical tracks + *_at_counter events.
+    No model inference in here.
+    """
+    def __init__(self,
+                 frame_w, frame_h,
+                 excl_frac_x=0.10, excl_frac_y=0.10,
+                 dwell_s=1.5, max_time_gap_s=1.5, exit_gap_s=3.5,
+                 suppress_new_in_exit_s=2.5,
                  max_foot_dist_frac=0.12,
                  size_ratio_tol=(0.5, 2.0),
-                 min_hist_corr=0.60,
-                 base_radius_frac=0.06,
-                 speed_coef=2.5,
-                 vel_alpha=0.3,
+                 min_hist_corr=0.65,
+                 base_radius_frac=0.07,
+                 speed_coef=3.0,
+                 vel_alpha=0.35,
                  lowq_alpha=0.2,
-                 box_ema_alpha=0.4):
+                 box_ema_alpha=0.4,
+                 min_area_frac=0.0004,
+                 min_aspect=1.2, max_aspect=5.0):
         self.frame_w = frame_w
         self.frame_h = frame_h
         self.diag = math.hypot(frame_w, frame_h)
+
+        self.customer_tri, self.employee_tri, self.exit_tri = build_rois(frame_w, frame_h, excl_frac_x, excl_frac_y)
 
         self.dwell_s = dwell_s
         self.max_time_gap_s = max_time_gap_s
@@ -137,33 +133,31 @@ class LogicalIDManager:
         self.lowq_alpha = lowq_alpha
         self.box_ema_alpha = box_ema_alpha
 
+        self.min_area_frac = min_area_frac
+        self.min_aspect = min_aspect
+        self.max_aspect = max_aspect
+
         self.active: Dict[int, Logical] = {}
         self.recent: Dict[int, Logical] = {}
         self.recent_exit: Dict[int, Tuple[Logical, float]] = {}
-        self.trackid_to_lid: Dict[int, int] = {}
 
-    def _feet_point(self, box):
-        return feet_point_from_box(box)
-
+    # helpers
+    def _feet_point(self, box): return feet_point_from_box(box)
     def _box_size(self, box):
         x1, y1, x2, y2 = map(float, box)
         return max(1.0, (x2 - x1) * (y2 - y1))
-
     def _predict_foot(self, obj: Logical, t_now: float):
         dt = max(0.0, t_now - obj.last_seen_t)
         return (obj.last_foot[0] + obj.vx * dt, obj.last_foot[1] + obj.vy * dt)
-
     def _search_radius(self, obj: Logical, t_now: float):
         dt = max(0.0, t_now - obj.last_seen_t)
         speed = math.hypot(obj.vx, obj.vy)
         return self.base_radius + self.speed_coef * speed * dt
-
     def _cost(self, pred_foot, det_foot, size_ratio, hist_c):
         dist = math.hypot(det_foot[0]-pred_foot[0], det_foot[1]-pred_foot[1])
         app_cost = 1.0 - max(-1.0, min(1.0, hist_c)) * 0.5 - 0.5
         size_cost = abs(math.log(max(1e-3, size_ratio)))
         return 1.0 * dist + 0.4 * app_cost + 0.2 * size_cost, dist
-
     def _match_pool(self, pool: Dict[int, Logical], det_foot, det_size, det_hist, t_now, relax=False):
         best_lid, best_cost, best_dist = None, 1e18, 1e18
         for lid, obj in pool.items():
@@ -180,9 +174,20 @@ class LogicalIDManager:
                 best_lid, best_cost, best_dist = lid, cost, dist
         return best_lid
 
-    def assign(self, frame_bgr, detections: List[Dict], t_now: float,
-               customer_tri, employee_tri, exit_tri,
-               min_area_frac: float, min_aspect: float, max_aspect: float):
+    def _ready_to_log(self, obj: Logical, t_now: float) -> bool:
+        if obj.logged or obj.roi_entry_start_t is None:
+            return False
+        if obj.role.lower() not in {"customer", "employee"}:
+            return False
+        return (t_now - obj.roi_entry_start_t) >= self.dwell_s
+
+    def step_from_dets(self, frame_bgr, human_dets: List[Dict], t_now: float):
+        """
+        human_dets: [{ 'track_id': int, 'box': xyxy, 'role': 'customer'|'employee' }]
+        returns:
+          human_tracks: [{lid, role, track_id, box, in_role_roi}]
+          new_events:   [{'type': 'customer_at_counter'|'employee_at_counter', 'lid', 'track_id', 'box', 't'}]
+        """
         # mark untouched
         for obj in self.active.values():
             obj.touched = False
@@ -190,39 +195,37 @@ class LogicalIDManager:
         frame_area = float(self.frame_w * self.frame_h)
         new_map = {}
         results = []
+        new_events = []
 
         exit_guard_lids = [lid for lid, (_o, t0) in self.recent_exit.items()
                            if t_now - t0 <= self.suppress_new_in_exit_s]
         assigned_lids = set()
 
-        for det in detections:
+        for det in human_dets:
             tid = det["track_id"]; box = det["box"]; role = det["role"]
-
-            # quality checks
+            # quality
             x1, y1, x2, y2 = map(float, box)
             bw, bh = max(1.0, x2-x1), max(1.0, y2-y1)
             area_frac = (bw * bh) / max(1.0, frame_area)
             aspect = bh / bw
-            low_quality = (area_frac < min_area_frac) or not (min_aspect <= aspect <= max_aspect)
+            low_quality = (area_frac < self.min_area_frac) or not (self.min_aspect <= aspect <= self.max_aspect)
 
             det_foot = self._feet_point(box)
             det_size = self._box_size(box)
             det_hist = compute_hsv_hist(frame_bgr, box)
-            in_exit_now = point_in_triangle(det_foot, exit_tri)
+            in_exit_now = point_in_triangle(det_foot, self.exit_tri)
 
-            # 1) Try ACTIVE
+            # pools
             lid = self._match_pool(self.active, det_foot, det_size, det_hist, t_now, relax=False)
             obj = None
             if lid is not None and lid not in assigned_lids:
                 obj = self.active[lid]
             else:
-                # 2) RECENT
                 lid = self._match_pool(self.recent, det_foot, det_size, det_hist, t_now, relax=False)
                 if lid is not None and lid not in assigned_lids:
                     obj = self.recent.pop(lid)
                     self.active[lid] = obj
                 else:
-                    # 3) EXIT-RECENT (relaxed)
                     if in_exit_now:
                         lid = self._match_pool({k:v for k,(v,_) in self.recent_exit.items()},
                                                det_foot, det_size, det_hist, t_now, relax=True)
@@ -230,7 +233,7 @@ class LogicalIDManager:
                             obj, _ = self.recent_exit.pop(lid)
                             self.active[lid] = obj
 
-            # 4) New logical if allowed
+            # new logical?
             if obj is None:
                 if in_exit_now and exit_guard_lids:
                     continue
@@ -248,19 +251,16 @@ class LogicalIDManager:
                 )
                 self.active[lid] = obj
 
-            # update velocity & state
+            # update velocity/state
             dt = max(1e-3, t_now - obj.last_seen_t)
-            pred_foot = self._predict_foot(obj, t_now)
             inst_vx = (det_foot[0] - obj.last_foot[0]) / dt
             inst_vy = (det_foot[1] - obj.last_foot[1]) / dt
-            obj.vx = (1 - 0.3) * obj.vx + 0.3 * inst_vx
-            obj.vy = (1 - 0.3) * obj.vy + 0.3 * inst_vy
+            obj.vx = (1 - self.vel_alpha) * obj.vx + self.vel_alpha * inst_vx
+            obj.vy = (1 - self.vel_alpha) * obj.vy + self.vel_alpha * inst_vy
 
-            prev_role = obj.role
             obj.last_seen_t = t_now
             obj.last_foot = det_foot
-
-            obj.last_box = (1.0 - 0.4) * obj.last_box + 0.4 * np.array(box, dtype=float)
+            obj.last_box = (1.0 - self.box_ema_alpha) * obj.last_box + self.box_ema_alpha * np.array(box, dtype=float)
             obj.last_size = self._box_size(obj.last_box)
             if det_hist is not None:
                 obj.hist = det_hist if obj.hist is None else (obj.hist * 0.9 + det_hist * 0.1)
@@ -275,20 +275,25 @@ class LogicalIDManager:
                 obj.is_exiting = False
 
             # dwell by role-appropriate ROI
-            if in_role_roi(det_foot, obj.role.lower(), customer_tri, employee_tri, exit_tri):
+            if in_role_roi(det_foot, obj.role.lower(), self.customer_tri, self.employee_tri, self.exit_tri):
                 if obj.roi_entry_start_t is None:
                     obj.roi_entry_start_t = t_now
             else:
                 obj.roi_entry_start_t = None
 
-            results.append({"logical_id": obj.lid, "track_id": tid, "box": obj.last_box.copy(),
-                            "role": obj.role, "prev_role": prev_role,
-                            "in_role_roi": obj.roi_entry_start_t is not None})
+            # emit event?
+            if self._ready_to_log(obj, t_now):
+                evt_type = f"{obj.role.lower()}_at_counter"
+                new_events.append({"type": evt_type, "lid": obj.lid, "track_id": obj.current_track_id,
+                                   "box": obj.last_box.copy(), "t": t_now})
+                obj.logged = True
 
+            results.append({"lid": obj.lid, "role": obj.role, "track_id": obj.current_track_id,
+                            "box": obj.last_box.copy(), "in_role_roi": obj.roi_entry_start_t is not None})
             new_map[tid] = obj.lid
             assigned_lids.add(obj.lid)
 
-        # Move untouched actives
+        # move untouched -> recent / recent_exit
         for lid, obj in list(self.active.items()):
             if not obj.touched:
                 if obj.is_exiting and obj.exit_since_t is not None:
@@ -297,7 +302,7 @@ class LogicalIDManager:
                     self.recent[lid] = obj
                 del self.active[lid]
 
-        # Expire recents
+        # expire recents
         for lid, obj in list(self.recent.items()):
             if t_now - obj.last_seen_t > self.max_time_gap_s:
                 del self.recent[lid]
@@ -305,147 +310,4 @@ class LogicalIDManager:
             if t_now - obj.last_seen_t > self.exit_gap_s:
                 del self.recent_exit[lid]
 
-        self.trackid_to_lid = new_map
-        return results
-
-    def ready_to_log(self, lid, t_now):
-        obj = self.active.get(lid)
-        if not obj or obj.logged or obj.roi_entry_start_t is None:
-            return False
-        if obj.role.lower() not in {"customer", "employee"}:
-            return False
-        return (t_now - obj.roi_entry_start_t) >= self.dwell_s
-
-    def mark_logged(self, lid):
-        if lid in self.active:
-            self.active[lid].logged = True
-
-# ---------- Tracker Engine ----------
-def resolve_tracker_yaml_strict(name: Optional[str]) -> str:
-    req = (name or "botsort").lower()
-    try:
-        import ultralytics as ul
-        base = Path(ul.__file__).parent / "cfg" / "trackers"
-    except Exception:
-        base = Path("ultralytics") / "cfg" / "trackers"
-    if req in {"botsort", "bot", "bot-sort"}:
-        p = base / "botsort.yaml"
-        if not p.exists():
-            raise FileNotFoundError(f"BoT-SORT YAML not found at '{p}'.")
-        return str(p)
-    if req in {"strongsort", "strong", "strong-sort"}:
-        p = base / "strongsort.yaml"
-        if not p.exists():
-            raise FileNotFoundError(f"StrongSORT YAML not found at '{p}'.")
-        return str(p)
-    p = Path(req)
-    if not p.exists():
-        raise FileNotFoundError(f"Tracker YAML '{req}' not found.")
-    return str(p)
-
-class TrackerEngine:
-    def __init__(self,
-                 weights_path: str = "models/weights.pt",
-                 conf: float = 0.45,
-                 tracker_name: str = "botsort",
-                 frame_w: int = 1920,
-                 frame_h: int = 1080,
-                 excl_frac_x: float = 0.10,
-                 excl_frac_y: float = 0.10,
-                 dwell_s: float = 1.5,
-                 max_time_gap_s: float = 1.5,
-                 exit_gap_s: float = 3.5,
-                 min_area_frac: float = 0.0004,
-                 min_aspect: float = 1.2,
-                 max_aspect: float = 5.0):
-        self.model = YOLO(weights_path)
-        self.conf = conf
-        self.tracker_yaml = resolve_tracker_yaml_strict(tracker_name)
-        self.frame_w = frame_w
-        self.frame_h = frame_h
-        (self.customer_tri,
-         self.employee_tri,
-         self.exit_tri) = build_rois(frame_w, frame_h, excl_frac_x, excl_frac_y)
-
-        self.lidm = LogicalIDManager(
-            frame_w=frame_w, frame_h=frame_h,
-            dwell_s=dwell_s, max_time_gap_s=max_time_gap_s,
-            exit_gap_s=exit_gap_s, suppress_new_in_exit_s=2.5,
-            max_foot_dist_frac=0.12, min_hist_corr=0.65,
-            base_radius_frac=0.07, speed_coef=3.0, vel_alpha=0.35,
-            lowq_alpha=0.2, box_ema_alpha=0.4
-        )
-        self.min_area_frac = min_area_frac
-        self.min_aspect = min_aspect
-        self.max_aspect = max_aspect
-
-    def step(self, frame_bgr, t_now: float):
-        """
-        Returns:
-          dict with:
-            human_tracks: [{lid, role, track_id, box, in_role_roi}]
-            nonhuman: [{cls_id, label, conf, box}]
-            new_events: [{'type': 'customer_at_counter'|'employee_at_counter', ...}]
-        """
-        results = self.model.track(
-            frame_bgr, persist=True, tracker=self.tracker_yaml, conf=self.conf, verbose=False
-        )
-
-        human_dets, other_dets = [], []
-        if results and len(results) > 0 and hasattr(results[0], "boxes") and results[0].boxes is not None:
-            boxes = results[0].boxes
-            xyxy = boxes.xyxy.cpu().numpy() if hasattr(boxes.xyxy, "cpu") else boxes.xyxy
-            ids = boxes.id.cpu().numpy().astype(int).flatten() if getattr(boxes, "id", None) is not None else None
-            confs = boxes.conf.cpu().numpy() if getattr(boxes, "conf", None) is not None else None
-            clses = boxes.cls.cpu().numpy().astype(int).flatten() if getattr(boxes, "cls", None) is not None else None
-
-            n = len(xyxy)
-            for i in range(n):
-                if confs is not None and confs[i] < self.conf:
-                    continue
-                box_xyxy = xyxy[i]
-                track_id = int(ids[i]) if ids is not None and i < len(ids) else -1
-                cls_id = int(clses[i]) if clses is not None and i < len(clses) else -1
-                label = CLASS_NAMES.get(cls_id, f"class_{cls_id}")
-                if cls_id in HUMAN_CLASS_IDS:
-                    role = "customer" if cls_id == 5 else "employee"
-                    human_dets.append({"track_id": track_id, "box": box_xyxy, "role": role, "cls_id": cls_id})
-                else:
-                    other_dets.append({"cls_id": cls_id, "label": label, "conf": float(confs[i]) if confs is not None else 0.0, "box": box_xyxy})
-
-        # Assign logical IDs to humans
-        assigned = self.lidm.assign(
-            frame_bgr, human_dets, t_now,
-            self.customer_tri, self.employee_tri, self.exit_tri,
-            min_area_frac=self.min_area_frac, min_aspect=self.min_aspect, max_aspect=self.max_aspect
-        )
-
-        # Build human tracks and detect dwell events
-        human_tracks = []
-        new_events = []
-        for det in assigned:
-            lid = det["logical_id"]
-            in_roi = det["in_role_roi"]
-            human_tracks.append({
-                "lid": lid,
-                "role": det["role"],
-                "track_id": det["track_id"],
-                "box": det["box"],
-                "in_role_roi": in_roi
-            })
-            if self.lidm.ready_to_log(lid, t_now):
-                evt_type = f"{det['role'].lower()}_at_counter"
-                new_events.append({
-                    "type": evt_type,
-                    "lid": lid,
-                    "track_id": det["track_id"],
-                    "box": det["box"],
-                    "t": t_now
-                })
-                self.lidm.mark_logged(lid)
-
-        return {
-            "human_tracks": human_tracks,
-            "nonhuman": other_dets,
-            "new_events": new_events
-        }
+        return results, new_events
