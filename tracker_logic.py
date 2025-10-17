@@ -5,7 +5,7 @@ import cv2
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict, List
 
-# --- Classes (shared map) ---
+# --- Classes (must match your model) ---
 CLASS_NAMES = {
     0: "Card Machine",
     1: "Cash",
@@ -32,7 +32,7 @@ def point_in_triangle(pt, tri):
 
 def build_rois(width, height, excl_frac_x=0.10, excl_frac_y=0.10):
     """
-    Two triangles split by diagonal (0,0)->(W,H) for event-side gating only:
+    Two triangles split by diagonal (0,0)->(W,H) for event gating only:
       - customer_tri: 'above/right' of diagonal
       - employee_tri: 'below/left' of diagonal
     exit_tri: small top-right wedge to suppress false entries.
@@ -203,7 +203,7 @@ class TrackerLogic:
 
         for det in human_dets:
             tid = det["track_id"]; box = det["box"]; role = det["role"]
-            # quality
+
             x1, y1, x2, y2 = map(float, box)
             bw, bh = max(1.0, x2-x1), max(1.0, y2-y1)
             area_frac = (bw * bh) / max(1.0, frame_area)
