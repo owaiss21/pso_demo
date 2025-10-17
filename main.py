@@ -17,7 +17,8 @@ from ultralytics import YOLO
 # - barcode_logic.py  (provides BarcodeMonitor with gap-reappear robustness, BarcodeDecider)
 from tracker_logic import TrackerLogic, CLASS_NAMES, HUMAN_CLASS_IDS
 from card_logic import CardMachineMonitor, TransactionDecider
-from barcode_logic import BarcodeMonitor, BarcodeDecider
+from barcode_logic import BarcodeMonitor, BarcodeMotionProxy, BarcodeDecider
+
 
 
 # ----------------------------
@@ -450,7 +451,7 @@ if __name__ == "__main__":
     parser.add_argument("--conf", type=float, default=0.45, help="YOLO confidence threshold")
     parser.add_argument("--tracker", type=str, default="tracker/botsort_custom.yaml",
                         help="Path or name of tracker yaml (path preferred).")
-    parser.add_argument("--out-fps", type=float, default=24.0, help="Output video FPS")
+    parser.add_argument("--out-fps", type=float, default=20.0, help="Output video FPS")
     parser.add_argument("--overlay-secs", type=float, default=2.0, help="Overlay banner duration in seconds")
     parser.add_argument("--no-viz-anchors", action="store_true", help="Disable anchor/line visualization")
     args = parser.parse_args()

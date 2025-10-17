@@ -100,11 +100,19 @@ class CardMachineMonitor:
 class TransactionDecider:
     """
     Emits exactly one of {'card_transaction','cash_transaction'} per customer session.
-    - Card: when the Card Machine is moved while a customer is at the counter.
-    - Cash: when 'Cash Register OPEN' (class 4) is detected while a customer is at the counter.
+
+    Primary signals:
+      - Card: when the Card Machine is moved while a customer is at the counter. (Optional/redundant if machine is fixed.)
+      - Cash: when 'Cash Register OPEN' (class 4) is detected while a customer is at the counter.
+
+    Fallback:
+      - If a customer session lasts >= fallback_min_dwell_s and ends with neither cash nor card marked,
+        mark it as 'card_transaction' on session end.
+
     Sessions reset after the customer is absent for rearm_gap_s seconds.
     """
     rearm_gap_s: float = 2.0
+    fallback_min_dwell_s: float = 4.5  # 4–5s per your requirement
 
     # lid -> session state
     sessions: Dict[int, Dict] = field(default_factory=dict)
@@ -114,7 +122,8 @@ class TransactionDecider:
         s = self.sessions.get(lid)
         if s is None:
             s = dict(
-                started_t=t_now, last_seen_t=t_now,
+                started_t=t_now,     # when customer_at_counter fired for this LID
+                last_seen_t=t_now,   # last frame we saw this customer in ROI
                 card_marked=False,
                 cash_marked=False
             )
@@ -143,21 +152,17 @@ class TransactionDecider:
             self._ensure_session(h["lid"], t_now)
             present_lids.add(h["lid"])
 
-        # CARD decision
+        # --- PRIMARY: CARD by movement (kept for completeness; can be disabled if undesired) ---
         if card_state.get("is_moved") and present_customers:
             card_c = card_state.get("current_center")
             if card_c is not None:
                 closest = self._nearest_customer(card_c, present_customers)
                 s = self.sessions[closest["lid"]]
                 if not s["card_marked"] and not s["cash_marked"]:
-                    events.append({
-                        "type": "card_transaction",
-                        "lid": closest["lid"],
-                        "t": t_now
-                    })
+                    events.append({"type": "card_transaction", "lid": closest["lid"], "t": t_now, "note": "card_move"})
                     s["card_marked"] = True
 
-        # CASH decision (only if not card already)
+        # --- PRIMARY: CASH by 'Cash Register OPEN' ---
         cash_open_dets = [d for d in other_dets if d.get("cls_id") == CLASS_CASH_REGISTER_OPEN]
         if cash_open_dets and present_customers:
             best_open = max(cash_open_dets, key=lambda d: d.get("conf", 0.0))
@@ -165,19 +170,23 @@ class TransactionDecider:
             closest = self._nearest_customer(reg_c, present_customers)
             s = self.sessions[closest["lid"]]
             if not s["card_marked"] and not s["cash_marked"]:
-                events.append({
-                    "type": "cash_transaction",
-                    "lid": closest["lid"],
-                    "t": t_now
-                })
+                events.append({"type": "cash_transaction", "lid": closest["lid"], "t": t_now, "note": "cash_open"})
                 s["cash_marked"] = True
 
-        # Cleanup sessions (re-arm)
+        # --- CLEANUP & FALLBACK on session end ---
+        # Any sessions whose customer is no longer present and has been absent long enough?
         to_delete = []
         for lid, s in self.sessions.items():
             inactive = (t_now - s["last_seen_t"]) >= self.rearm_gap_s
             if lid not in present_lids and inactive:
+                # Fallback: long-enough session with no cash or card → mark card
+                dwell = max(0.0, s["last_seen_t"] - s["started_t"])
+                if (not s["cash_marked"]) and (not s["card_marked"]) and (dwell >= self.fallback_min_dwell_s):
+                    events.append({"type": "card_transaction", "lid": lid, "t": s["last_seen_t"], "note": "fallback_dwell"})
+                    # No need to set card_marked (we are deleting), but harmless if we do:
+                    s["card_marked"] = True
                 to_delete.append(lid)
+
         for lid in to_delete:
             self.sessions.pop(lid, None)
 
