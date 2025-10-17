@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 import math
 
-CLASS_SCAN_GUN = 6  # must match your model
+CLASS_SCAN_GUN = 7  # must match your model
 
 # ------------- helpers -------------
 def _center(xyxy):

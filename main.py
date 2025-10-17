@@ -171,7 +171,7 @@ def draw_counter_hud(frame, counts):
 # ----------------------------
 def main(
     video_path: str,
-    weights_path: str = "models/weights_v2.pt",
+    weights_path: str = "models/weights.pt",
     conf: float = 0.45,
     tracker_yaml_arg: str = "trackers/botsort_counter.yaml",
     out_fps: float = 24.0,

@@ -7,11 +7,16 @@ from typing import Optional, Tuple, Dict, List
 
 # --- Classes (must match your model) ---
 CLASS_NAMES = {
-    0: "Card Machine", 1: "Cash",
-    2: "Cash Register CLOSED", 3: "Cash Register OPEN", 4: "Customer",
-    5: "Employee", 6: "Scan Gun",
+    0: "Card Machine",
+    1: "Cash",
+    2: "Cash During Trns",
+    3: "Cash Register CLOSED",
+    4: "Cash Register OPEN",
+    5: "Customer",
+    6: "Employee",
+    7: "Scan Gun",
 }
-HUMAN_CLASS_IDS = {5, 4}  # Customer, Employee
+HUMAN_CLASS_IDS = {5, 6}  # Customer, Employee
 
 # ---------- Geometry / ROI ----------
 def point_in_triangle(pt, tri):

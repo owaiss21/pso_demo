@@ -5,7 +5,7 @@ import math
 
 # Class IDs
 CLASS_CARD_MACHINE = 0
-CLASS_CASH_REGISTER_OPEN = 3
+CLASS_CASH_REGISTER_OPEN = 4
 
 def _center(xyxy):
     x1, y1, x2, y2 = map(float, xyxy)
