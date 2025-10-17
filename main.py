@@ -448,7 +448,7 @@ if __name__ == "__main__":
     parser.add_argument("video_path")
     parser.add_argument("--weights", default="models/weights.pt", help="Path to YOLO weights")
     parser.add_argument("--conf", type=float, default=0.45, help="YOLO confidence threshold")
-    parser.add_argument("--tracker", type=str, default="trackers/botsort_counter.yaml",
+    parser.add_argument("--tracker", type=str, default="tracker/botsort_custom.yaml",
                         help="Path or name of tracker yaml (path preferred).")
     parser.add_argument("--out-fps", type=float, default=24.0, help="Output video FPS")
     parser.add_argument("--overlay-secs", type=float, default=2.0, help="Overlay banner duration in seconds")
