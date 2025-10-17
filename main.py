@@ -11,14 +11,13 @@ from datetime import datetime, timezone, timedelta
 from tqdm import tqdm
 from ultralytics import YOLO
 
-# Local modules you already have in this project:
-# - tracker_logic.py  (provides TrackerLogic, CLASS_NAMES, HUMAN_CLASS_IDS)
-# - card_logic.py     (provides CardMachineMonitor, TransactionDecider)
-# - barcode_logic.py  (provides BarcodeMonitor with gap-reappear robustness, BarcodeDecider)
+# Local modules you provide:
+# - tracker_logic.py  -> TrackerLogic, CLASS_NAMES, HUMAN_CLASS_IDS
+# - card_logic.py     -> CardMachineMonitor, TransactionDecider
+# - barcode_logic.py  -> BarcodeMonitor, BarcodeDecider
 from tracker_logic import TrackerLogic, CLASS_NAMES, HUMAN_CLASS_IDS
 from card_logic import CardMachineMonitor, TransactionDecider
-from barcode_logic import BarcodeMonitor, BarcodeMotionProxy, BarcodeDecider
-
+from barcode_logic import BarcodeMonitor, BarcodeDecider
 
 
 # ----------------------------
@@ -44,15 +43,10 @@ def resolve_tracker_yaml_strict(name: str = "botsort"):
             raise FileNotFoundError(f"StrongSORT YAML not found at '{p}'.")
         return str(p)
 
-    # If it's not a known name, interpret as a path (validated by caller)
     return req
 
 
 def resolve_tracker_yaml(user_arg: str):
-    """
-    If user passes a path that exists, use it.
-    Otherwise, try strict resolver for builtin names ('botsort', 'strongsort').
-    """
     if user_arg:
         p = Path(user_arg)
         if p.exists():
@@ -94,12 +88,9 @@ def draw_box_with_label(frame, xyxy, label: str):
 
 
 # ----------------------------
-# Overlay banners (transient)
+# Overlay banners (transient, top-right)
 # ----------------------------
 def add_overlay(active_overlays, text: str, pos: str, now_t: float, dur_s: float = 2.0):
-    """
-    pos: 'tl' (top-left) or 'tr' (top-right)
-    """
     active_overlays.append({"text": text, "pos": pos, "end_t": now_t + dur_s})
 
 
@@ -140,15 +131,7 @@ def draw_overlays(frame, active_overlays, now_t: float, frame_w: int):
 # ----------------------------
 # Persistent counter HUD (top-left)
 # ----------------------------
-def draw_counter_hud(frame, counts, frame_w: int):
-    """
-    Always-visible HUD at top-left with dynamic counts:
-      - Customers at counter (unique sessions)
-      - Barcode used
-      - Total transactions
-      - Cash transactions
-      - Card transactions
-    """
+def draw_counter_hud(frame, counts):
     margin = 12
     pad_x = 10
     pad_y = 8
@@ -165,7 +148,6 @@ def draw_counter_hud(frame, counts, frame_w: int):
         f"  Card: {counts['card']}",
     ]
 
-    # Measure widest line
     sizes = [cv2.getTextSize(s, font, scale, thick)[0] for s in lines]
     max_w = max(w for (w, h) in sizes)
     total_h = sum(h for (w, h) in sizes) + (len(lines) - 1) * line_gap
@@ -175,10 +157,8 @@ def draw_counter_hud(frame, counts, frame_w: int):
     box_w = max_w + 2 * pad_x
     box_h = total_h + 2 * pad_y
 
-    # Background
     cv2.rectangle(frame, (x, y), (x + box_w, y + box_h), (0, 0, 0), -1)
 
-    # Text lines
     cur_y = y + pad_y
     for (s, (tw, th)) in zip(lines, sizes):
         cv2.putText(frame, s, (x + pad_x, cur_y + th),
@@ -191,12 +171,13 @@ def draw_counter_hud(frame, counts, frame_w: int):
 # ----------------------------
 def main(
     video_path: str,
-    weights_path: str = "models/weights.pt",
+    weights_path: str = "models/weights_v2.pt",
     conf: float = 0.45,
     tracker_yaml_arg: str = "trackers/botsort_counter.yaml",
     out_fps: float = 24.0,
     overlay_secs: float = 2.0,
     viz_anchors: bool = True,   # draw anchors/lines for card machine & scan gun
+    show_preview: bool = False, # live preview toggle
 ):
     # Silence Ultralytics logs
     try:
@@ -207,7 +188,6 @@ def main(
     except Exception:
         pass
 
-    # Open video
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"Error opening video: {video_path}", file=sys.stderr)
@@ -233,7 +213,7 @@ def main(
     writer = csv.writer(f_csv)
     writer.writerow(["event", "logical_id", "video_time", "system_time_utc", "frame_idx", "note"])
 
-    # Inference setup
+    # Inference
     model = YOLO(weights_path)
     tracker_yaml = resolve_tracker_yaml(tracker_yaml_arg)
 
@@ -247,6 +227,7 @@ def main(
 
     diag = math.hypot(width, height)
 
+    # Card machine + transactions (with fallback in TransactionDecider)
     cm_monitor = CardMachineMonitor(
         stable_radius_px=0.02 * diag,
         stable_confirm_s=2.0,
@@ -254,20 +235,20 @@ def main(
         moved_min_duration_s=0.25,
         rest_min_duration_s=0.8
     )
-    tx_decider = TransactionDecider(rearm_gap_s=2.0)
+    tx_decider = TransactionDecider(
+        rearm_gap_s=2.0,
+        fallback_min_dwell_s=4.5
+    )
 
-    # Barcode (scan gun) monitor with gap-reappear robustness
+    # Barcode (scan gun): simplified anchor-only monitor + decider
+    # after computing diag
     bc_monitor = BarcodeMonitor(
-        stable_radius_px=0.02 * diag,      # jitter band near cradle
-        stable_confirm_s=2.0,               # time to lock initial cradle
-        moved_threshold_px=0.06 * diag,     # continuous away threshold
-        moved_min_duration_s=0.30,          # continuous away duration
-        rest_min_duration_s=0.8,            # rest dwell to adopt new cradle
-        gap_min_absent_s=0.10,              # if missing >= this and reappear far -> moved
-        reappear_moved_threshold_px=0.06 * diag,
-        fast_move_px=0.08 * diag            # optional jerk trigger
+        rest_half_side_px=0.01 * diag,  # try 0.02–0.03 * diag; increase if jittery
+        lock_confirm_s=1.5,
+        adopt_rest_s=0.8,
     )
     bc_decider = BarcodeDecider(rearm_gap_s=2.0)
+
 
     start_wallclock = datetime.now(timezone.utc)
 
@@ -288,7 +269,7 @@ def main(
 
     next_write_t = 0.0
     write_dt = 1.0 / max(0.1, float(out_fps))
-    active_overlays = []  # transient messages (top-right)
+    active_overlays = []  # transient banners at top-right
     overlay_duration = float(overlay_secs)
 
     # Persistent counters
@@ -300,6 +281,7 @@ def main(
         "card": 0,
     }
 
+    user_aborted = False
     orig_idx = 0
     try:
         while True:
@@ -309,7 +291,7 @@ def main(
 
             t_now = orig_idx / in_fps
 
-            # ---- Inference & tracking (Ultralytics) ----
+            # Inference & tracking
             results = model.track(
                 frame,
                 persist=True,
@@ -328,7 +310,6 @@ def main(
 
                 n = len(xyxy)
                 for i in range(n):
-                    # confidence check
                     if confs is not None and confs[i] < conf:
                         continue
 
@@ -338,7 +319,6 @@ def main(
                     label = CLASS_NAMES.get(cls_id, f"class_{cls_id}")
 
                     if cls_id in HUMAN_CLASS_IDS:
-                        # No diagonal role reassignment — class defines role
                         role = "customer" if cls_id == 5 else "employee"
                         human_dets.append({"track_id": track_id, "box": box_xyxy, "role": role})
                     else:
@@ -349,33 +329,34 @@ def main(
                             "box": box_xyxy
                         })
 
-            # ---- Tracking logic (no model calls) ----
+            # Logical tracks & at-counter events
             human_tracks, at_counter_events = logic.step_from_dets(frame, human_dets, t_now)
 
-            # ---- Card machine & transactions ----
-            card_boxes = [d for d in other_dets if d["cls_id"] == 0]  # Card Machine
+            # Card machine & transactions
+            card_boxes = [d for d in other_dets if d["cls_id"] == 0]
             cm_monitor.update(card_boxes, t_now)
             cm_state = cm_monitor.snapshot()
             tx_events = tx_decider.update(t_now, human_tracks, cm_state, other_dets)
 
-            # ---- Barcode monitor & 'barcode_used' events ----
-            scan_boxes = [d for d in other_dets if d["cls_id"] == 7]  # Scan Gun
+            # Barcode: simplified anchor-only logic
+            # after other_dets extraction
+            scan_boxes = [d for d in other_dets if d["cls_id"] == 7]
             bc_monitor.update(scan_boxes, t_now)
             bc_state = bc_monitor.snapshot()
             bc_events = bc_decider.update(t_now, human_tracks, bc_state)
 
-            # ---- CSV logging helper ----
+
+            # CSV logging helper
             def _log(evt_type, lid, note=""):
                 vt = format_hhmmss_msec(t_now)
                 st = (start_wallclock + timedelta(seconds=t_now)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
                 writer.writerow([evt_type, lid, vt, st, orig_idx, note])
 
-            # ---- Events -> CSV + Overlays + COUNTS ----
+            # Events -> CSV + Overlays + Counters
             for e in at_counter_events:
                 _log(e["type"], e["lid"])
                 if e["type"] == "customer_at_counter":
                     counts["customers"] += 1
-                    # Move this to top-right (with others)
                     add_overlay(active_overlays, f"CUSTOMER AT COUNTER (L{e['lid']})", "tr", t_now, overlay_duration)
 
             for e in bc_events:
@@ -384,7 +365,7 @@ def main(
                 add_overlay(active_overlays, "BARCODE GUN USED", "tr", t_now, overlay_duration)
 
             for e in tx_events:
-                _log(e["type"], e["lid"])
+                _log(e["type"], e["lid"], e.get("note", ""))
                 if e["type"] == "card_transaction":
                     counts["card"] += 1
                     counts["transactions_total"] += 1
@@ -394,36 +375,49 @@ def main(
                     counts["transactions_total"] += 1
                     add_overlay(active_overlays, "CASH TRANSACTION", "tr", t_now, overlay_duration)
 
-            # ---- Draw tracks and other boxes ----
+            # Draw tracks & non-human detections
             for h in human_tracks:
                 draw_human_track(frame, h["box"], h["lid"], h["track_id"], h["role"])
 
             for d in other_dets:
                 draw_box_with_label(frame, d["box"], d["label"])
 
-            # Optional: visualize anchors/lines for card machine & scan gun
+            # Optional anchors/lines for card machine & scan gun
             if viz_anchors:
                 # Card machine
                 pc = cm_state.get("persistent_center")
                 cc = cm_state.get("current_center")
                 if pc:
-                    cv2.circle(frame, (int(pc[0]), int(pc[1])), 6, (255, 0, 0), -1)  # blue
+                    cv2.circle(frame, (int(pc[0]), int(pc[1])), 6, (255, 0, 0), -1)
                 if pc and cc:
                     cv2.line(frame, (int(pc[0]), int(pc[1])), (int(cc[0]), int(cc[1])), (255, 0, 0), 2)
 
                 # Scan gun
+                # inside `if viz_anchors:` block
                 bpc = bc_state.get("persistent_center")
+                half = int(bc_state.get("rest_half_side_px", 0))
                 bcc = bc_state.get("current_center")
-                if bpc:
-                    cv2.circle(frame, (int(bpc[0]), int(bpc[1])), 6, (0, 128, 255), -1)  # orange-ish
+                if bpc and half > 0:
+                    x1, y1 = int(bpc[0] - half), int(bpc[1] - half)
+                    x2, y2 = int(bpc[0] + half), int(bpc[1] + half)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 128, 255), 2)  # resting square (orange/cyan)
                 if bpc and bcc:
-                    cv2.line(frame, (int(bpc[0]), int(bpc[1])), (int(bcc[0]), int(bcc[1])), (0, 128, 255), 2)
+                    cv2.line(frame, (int(bpc[0]), int(bpc[1])), (int(bcc[0]), int(bcc[1])), (0, 128, 255), 1)
 
-            # ---- Draw persistent HUD (top-left) and transient banners (top-right) ----
-            draw_counter_hud(frame, counts, width)
+
+            # HUD (top-left) + transient banners (top-right)
+            draw_counter_hud(frame, counts)
             draw_overlays(frame, active_overlays, t_now, width)
 
-            # ---- Output ----
+            # Live preview (toggle)
+            if show_preview:
+                cv2.imshow("Preview - Press q or Esc to stop", frame)
+                key = cv2.waitKey(1) & 0xFF
+                if key in (27, ord('q')):  # Esc or q
+                    user_aborted = True
+                    break
+
+            # Output pacing
             if t_now + 1e-6 >= next_write_t:
                 out.write(frame)
                 frame_path = frames_dir / f"frame_{int(round(t_now * 1000)):09d}.jpg"
@@ -438,7 +432,11 @@ def main(
         f_csv.close()
         out.release()
         cap.release()
+        if show_preview:
+            cv2.destroyAllWindows()
 
+    if user_aborted:
+        print("Stopped by user (preview).")
     print(f"Done.\nVideo:  {output_video_path}\nEvents: {events_csv_path}\nFrames: {frames_dir}")
 
 
@@ -451,9 +449,10 @@ if __name__ == "__main__":
     parser.add_argument("--conf", type=float, default=0.45, help="YOLO confidence threshold")
     parser.add_argument("--tracker", type=str, default="tracker/botsort_custom.yaml",
                         help="Path or name of tracker yaml (path preferred).")
-    parser.add_argument("--out-fps", type=float, default=20.0, help="Output video FPS")
+    parser.add_argument("--out-fps", type=float, default=24.0, help="Output video FPS")
     parser.add_argument("--overlay-secs", type=float, default=2.0, help="Overlay banner duration in seconds")
     parser.add_argument("--no-viz-anchors", action="store_true", help="Disable anchor/line visualization")
+    parser.add_argument("--show", action="store_true", help="Show live preview window")
     args = parser.parse_args()
 
     t0 = time.time()
@@ -465,5 +464,6 @@ if __name__ == "__main__":
         out_fps=args.out_fps,
         overlay_secs=args.overlay_secs,
         viz_anchors=not args.no_viz_anchors,
+        show_preview=args.show,
     )
     print(f"Time: {time.time()-t0:.2f}s")

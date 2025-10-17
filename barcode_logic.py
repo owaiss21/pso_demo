@@ -3,8 +3,9 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 import math
 
-CLASS_SCAN_GUN = 7  # must match your model
+CLASS_SCAN_GUN = 6  # must match your model
 
+# ------------- helpers -------------
 def _center(xyxy):
     x1, y1, x2, y2 = map(float, xyxy)
     return ((x1 + x2) * 0.5, (y1 + y2) * 0.5)
@@ -13,151 +14,107 @@ def _feet_center(xyxy):
     x1, y1, x2, y2 = map(float, xyxy)
     return (0.5*(x1+x2), y2)
 
-def _dist(a, b):
-    return math.hypot(a[0]-b[0], a[1]-b[1])
+def _outside_square(pt, ctr, half_side):
+    if pt is None or ctr is None:
+        return False
+    dx = abs(pt[0] - ctr[0])
+    dy = abs(pt[1] - ctr[1])
+    return (dx > half_side) or (dy > half_side)
 
+# ------------- square monitor -------------
 @dataclass
 class BarcodeMonitor:
     """
-    Tracks the persistent resting place of the Scan Gun and raises 'is_moved' when:
-      1) Continuous: center leaves the resting place by > moved_threshold_px for >= moved_min_duration_s, OR
-      2) Gap-reappear: after a detection GAP of >= gap_min_absent_s, it reappears >= reappear_moved_threshold_px away
-         from the resting place (or from last_center if resting not yet established).
-      3) Fast jerk (optional): single-frame displacement from resting place exceeds fast_move_px.
+    Square-anchor monitor for the Scan Gun.
 
-    All thresholds are in pixels; main.py should pass diag-scaled numbers.
+    - Establish a persistent resting square after the gun center remains within that
+      same square for `lock_confirm_s` seconds.
+    - If persistent exists and the current center is OUTSIDE the square, set `outside_now=True`.
+    - When the gun is put down (stays within a small square around its current center
+      for `adopt_rest_s` seconds), adopt that as the new persistent square (center changes).
     """
-    stable_radius_px: float
-    stable_confirm_s: float = 2.0
-    moved_threshold_px: float = 80.0
-    moved_min_duration_s: float = 0.30
-    rest_min_duration_s: float = 0.80
+    rest_half_side_px: float            # half side of the resting square
+    lock_confirm_s: float = 1.5         # time to confirm initial resting square
+    adopt_rest_s: float = 0.8           # time to adopt a new resting place
 
-    # New robustness knobs for detection gaps / fast pick-ups
-    gap_min_absent_s: float = 0.10
-    reappear_moved_threshold_px: Optional[float] = None  # default: moved_threshold_px if None
-    fast_move_px: Optional[float] = None  # if not None and distance > fast_move_px -> moved immediately
-
-    # Internal state
+    # state
     persistent_center: Optional[Tuple[float, float]] = None
-    persistent_establish_start_t: Optional[float] = None
     candidate_center: Optional[Tuple[float, float]] = None
+    candidate_start_t: Optional[float] = None
 
     last_center: Optional[Tuple[float, float]] = None
     last_seen_t: Optional[float] = None
 
-    move_start_t: Optional[float] = None
-    is_moved: bool = False
+    outside_now: bool = False
 
-    rest_candidate: Optional[Tuple[float, float]] = None
-    rest_start_t: Optional[float] = None
-
-    missing_since_t: Optional[float] = None  # when detection first went missing
-
-    def _reappear_check(self, center, t_now):
-        """Trigger moved immediately if we had a gap and reappeared far from resting (or last seen)."""
-        if self.missing_since_t is None or self.last_seen_t is None:
-            return
-        absent_dt = t_now - self.missing_since_t
-        if absent_dt < max(0.0, self.gap_min_absent_s):
-            return
-
-        anchor = self.persistent_center if self.persistent_center is not None else self.last_center
-        if anchor is None:
-            return
-
-        thr = self.reappear_moved_threshold_px or self.moved_threshold_px
-        if _dist(center, anchor) >= thr:
-            # Instant move due to reappear far away
-            self.is_moved = True
-            # Clear any continuous timers; we’re already “moved”
-            self.move_start_t = None
+    adopt_center: Optional[Tuple[float, float]] = None
+    adopt_start_t: Optional[float] = None
 
     def update(self, scan_boxes: List[Dict], t_now: float):
-        """
-        scan_boxes: list of { 'box': [x1,y1,x2,y2], 'conf': float, 'cls_id': int==7 }
-        Picks highest-confidence detection this frame (if any) and updates state.
-        """
         if not scan_boxes:
-            # track missing
-            if self.missing_since_t is None:
-                self.missing_since_t = t_now
             return
 
-        # We have a detection this frame
         best = max(scan_boxes, key=lambda d: d.get("conf", 0.0))
-        center = _center(best["box"])
-
-        # If we were missing, run the gap-reappear trigger
-        if self.missing_since_t is not None:
-            self._reappear_check(center, t_now)
-            self.missing_since_t = None  # reset missing flag
-
-        # Update last seen
-        self.last_center = center
+        c = _center(best["box"])
+        self.last_center = c
         self.last_seen_t = t_now
 
-        # Establish initial persistent place
+        # Lock initial square
         if self.persistent_center is None:
             if self.candidate_center is None:
-                self.candidate_center = center
-                self.persistent_establish_start_t = t_now
+                self.candidate_center = c
+                self.candidate_start_t = t_now
             else:
-                if _dist(center, self.candidate_center) <= self.stable_radius_px:
-                    if (t_now - (self.persistent_establish_start_t or t_now)) >= self.stable_confirm_s:
+                # still within candidate square?
+                if not _outside_square(c, self.candidate_center, self.rest_half_side_px):
+                    if (t_now - (self.candidate_start_t or t_now)) >= self.lock_confirm_s:
                         self.persistent_center = self.candidate_center
-                        self.rest_candidate = self.candidate_center
-                        self.rest_start_t = t_now
+                        # seed adopt state
+                        self.adopt_center = self.persistent_center
+                        self.adopt_start_t = t_now
                 else:
-                    self.candidate_center = center
-                    self.persistent_establish_start_t = t_now
+                    # restart candidate
+                    self.candidate_center = c
+                    self.candidate_start_t = t_now
+            self.outside_now = False
             return
 
-        # With a persistent center, evaluate displacement
-        d = _dist(center, self.persistent_center)
+        # We have a persistent square: are we outside it now?
+        self.outside_now = _outside_square(c, self.persistent_center, self.rest_half_side_px)
 
-        # Optional “fast jerk” immediate trigger
-        if self.fast_move_px is not None and d > self.fast_move_px:
-            self.is_moved = True
-            self.move_start_t = None
+        # Adoption: when it rests (wherever it is), adopt a new center after `adopt_rest_s`
+        # Track stability around current center using a small square with same half-side
+        if self.adopt_center is None or _outside_square(c, self.adopt_center, self.rest_half_side_px):
+            self.adopt_center = c
+            self.adopt_start_t = t_now
         else:
-            # Continuous movement logic
-            if d > self.moved_threshold_px:
-                if self.move_start_t is None:
-                    self.move_start_t = t_now
-                elif (t_now - self.move_start_t) >= self.moved_min_duration_s:
-                    self.is_moved = True
-            else:
-                # Close to persistent again → consider resting
-                self.move_start_t = None
-                if self.rest_candidate is None or _dist(center, self.rest_candidate) > self.stable_radius_px:
-                    self.rest_candidate = center
-                    self.rest_start_t = t_now
-                else:
-                    if (t_now - (self.rest_start_t or t_now)) >= self.rest_min_duration_s:
-                        # If it had moved earlier and now rests elsewhere, adopt new persistent place
-                        if self.is_moved and _dist(self.rest_candidate, self.persistent_center) > self.stable_radius_px:
-                            self.persistent_center = self.rest_candidate
-                        # Reset move flag after a proper rest
-                        self.is_moved = False
+            if (t_now - (self.adopt_start_t or t_now)) >= self.adopt_rest_s:
+                # adopt new resting center
+                self.persistent_center = self.adopt_center
+                # keep adopt window rolling
+                self.adopt_start_t = t_now
 
     def snapshot(self):
         return {
             "persistent_center": self.persistent_center,
+            "rest_half_side_px": self.rest_half_side_px,
             "current_center": self.last_center,
-            "is_moved": self.is_moved
+            "outside_now": self.outside_now,
+            "locked": self.persistent_center is not None
         }
 
+# ------------- once-per-session decider -------------
 @dataclass
 class BarcodeDecider:
     """
-    Emits one 'barcode_used' per customer session WHEN the scan gun is 'moved'
-    while a customer is at the counter. Sessions keyed by logical customer ID (lid).
+    Emit one 'barcode_used' per customer session when:
+    - a customer is at the counter (role='customer' and in_role_roi=True), AND
+    - the scan gun center is OUTSIDE the resting square in that frame.
     """
     rearm_gap_s: float = 2.0
     sessions: Dict[int, Dict] = field(default_factory=dict)  # lid -> {last_seen_t, marked}
 
-    def _ensure_session(self, lid: int, t_now: float):
+    def _ensure(self, lid: int, t_now: float):
         s = self.sessions.get(lid)
         if s is None:
             s = dict(last_seen_t=t_now, marked=False)
@@ -167,40 +124,37 @@ class BarcodeDecider:
         return s
 
     def _nearest_customer(self, point_xy, customers: List[Dict]):
-        return min(
-            customers,
-            key=lambda h: _dist(point_xy, _feet_center(h["box"]))
-        )
+        # we still pick nearest to have a deterministic choice if multiple present
+        return min(customers, key=lambda h: math.hypot(point_xy[0] - _feet_center(h["box"])[0],
+                                                       point_xy[1] - _feet_center(h["box"])[1]))
 
-    def update(self, t_now: float, human_tracks: List[Dict], barcode_state: Dict):
-        """
-        human_tracks: [{lid, role, box, in_role_roi, ...}], only role='customer' & in_role_roi matter
-        barcode_state: {'persistent_center', 'current_center', 'is_moved'}
-        """
+    def update(self, t_now: float, human_tracks: List[Dict], bc_state: Dict):
         events = []
 
-        present_customers = [h for h in human_tracks if h["role"] == "customer" and h.get("in_role_roi")]
+        present = [h for h in human_tracks if h["role"] == "customer" and h.get("in_role_roi")]
         present_lids = set()
-        for h in present_customers:
-            self._ensure_session(h["lid"], t_now)
+        for h in present:
+            self._ensure(h["lid"], t_now)
             present_lids.add(h["lid"])
 
-        # Barcode event: gun moved while customer present
-        if barcode_state.get("is_moved") and present_customers:
-            bc_c = barcode_state.get("current_center")
-            if bc_c is not None:
-                closest = self._nearest_customer(bc_c, present_customers)
-                s = self.sessions[closest["lid"]]
-                if not s["marked"]:
-                    events.append({"type": "barcode_used", "lid": closest["lid"], "t": t_now})
-                    s["marked"] = True
+        if bc_state.get("outside_now") and present:
+            cc = bc_state.get("current_center")
+            if cc is None:
+                # fallback: just pick the first present customer
+                target = present[0]
+            else:
+                target = self._nearest_customer(cc, present)
+            s = self.sessions[target["lid"]]
+            if not s["marked"]:
+                events.append({"type": "barcode_used", "lid": target["lid"], "t": t_now})
+                s["marked"] = True
 
-        # Cleanup sessions (re-arm)
-        to_delete = []
+        # rearm
+        to_del = []
         for lid, s in self.sessions.items():
-            if (lid not in present_lids) and ((t_now - s["last_seen_t"]) >= self.rearm_gap_s):
-                to_delete.append(lid)
-        for lid in to_delete:
+            if lid not in present_lids and (t_now - s["last_seen_t"]) >= self.rearm_gap_s:
+                to_del.append(lid)
+        for lid in to_del:
             self.sessions.pop(lid, None)
 
         return events
