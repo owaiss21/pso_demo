@@ -11,7 +11,10 @@ from datetime import datetime, timezone, timedelta
 from tqdm import tqdm
 from ultralytics import YOLO
 
-# Local modules (make sure these files are in the same project)
+# Local modules you already have in this project:
+# - tracker_logic.py  (provides TrackerLogic, CLASS_NAMES, HUMAN_CLASS_IDS)
+# - card_logic.py     (provides CardMachineMonitor, TransactionDecider)
+# - barcode_logic.py  (provides BarcodeMonitor with gap-reappear robustness, BarcodeDecider)
 from tracker_logic import TrackerLogic, CLASS_NAMES, HUMAN_CLASS_IDS
 from card_logic import CardMachineMonitor, TransactionDecider
 from barcode_logic import BarcodeMonitor, BarcodeDecider
@@ -40,7 +43,7 @@ def resolve_tracker_yaml_strict(name: str = "botsort"):
             raise FileNotFoundError(f"StrongSORT YAML not found at '{p}'.")
         return str(p)
 
-    # If it's not a known name, interpret as a path (will be validated by caller)
+    # If it's not a known name, interpret as a path (validated by caller)
     return req
 
 
@@ -53,7 +56,6 @@ def resolve_tracker_yaml(user_arg: str):
         p = Path(user_arg)
         if p.exists():
             return str(p)
-    # fallback to builtin names resolution
     return resolve_tracker_yaml_strict(user_arg or "botsort")
 
 
@@ -91,7 +93,7 @@ def draw_box_with_label(frame, xyxy, label: str):
 
 
 # ----------------------------
-# Overlay banners
+# Overlay banners (transient)
 # ----------------------------
 def add_overlay(active_overlays, text: str, pos: str, now_t: float, dur_s: float = 2.0):
     """
@@ -135,13 +137,62 @@ def draw_overlays(frame, active_overlays, now_t: float, frame_w: int):
 
 
 # ----------------------------
+# Persistent counter HUD (top-left)
+# ----------------------------
+def draw_counter_hud(frame, counts, frame_w: int):
+    """
+    Always-visible HUD at top-left with dynamic counts:
+      - Customers at counter (unique sessions)
+      - Barcode used
+      - Total transactions
+      - Cash transactions
+      - Card transactions
+    """
+    margin = 12
+    pad_x = 10
+    pad_y = 8
+    line_gap = 6
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.7
+    thick = 2
+
+    lines = [
+        f"Customers: {counts['customers']}",
+        f"Barcode Used: {counts['barcode']}",
+        f"Transactions: {counts['transactions_total']}",
+        f"  Cash: {counts['cash']}",
+        f"  Card: {counts['card']}",
+    ]
+
+    # Measure widest line
+    sizes = [cv2.getTextSize(s, font, scale, thick)[0] for s in lines]
+    max_w = max(w for (w, h) in sizes)
+    total_h = sum(h for (w, h) in sizes) + (len(lines) - 1) * line_gap
+
+    x = margin
+    y = margin
+    box_w = max_w + 2 * pad_x
+    box_h = total_h + 2 * pad_y
+
+    # Background
+    cv2.rectangle(frame, (x, y), (x + box_w, y + box_h), (0, 0, 0), -1)
+
+    # Text lines
+    cur_y = y + pad_y
+    for (s, (tw, th)) in zip(lines, sizes):
+        cv2.putText(frame, s, (x + pad_x, cur_y + th),
+                    font, scale, (255, 255, 255), thick, cv2.LINE_AA)
+        cur_y += th + line_gap
+
+
+# ----------------------------
 # Main
 # ----------------------------
 def main(
     video_path: str,
     weights_path: str = "models/weights.pt",
     conf: float = 0.45,
-    tracker_yaml_arg: str = "trackers/botsort_custom.yaml",
+    tracker_yaml_arg: str = "trackers/botsort_counter.yaml",
     out_fps: float = 24.0,
     overlay_secs: float = 2.0,
     viz_anchors: bool = True,   # draw anchors/lines for card machine & scan gun
@@ -204,16 +255,16 @@ def main(
     )
     tx_decider = TransactionDecider(rearm_gap_s=2.0)
 
-    # Barcode (scan gun) with resting-place logic (mirrors card machine)
+    # Barcode (scan gun) monitor with gap-reappear robustness
     bc_monitor = BarcodeMonitor(
-        stable_radius_px=0.02 * diag,     # jitter band near cradle
-        stable_confirm_s=2.0,             # time to lock initial cradle
-        moved_threshold_px=0.06 * diag,   # away-from-cradle threshold (continuous)
-        moved_min_duration_s=0.30,        # must be away for this long (continuous)
-        rest_min_duration_s=0.80,         # dwell at new place to adopt
-        gap_min_absent_s=0.10,            # if missing >= this and reappears far → moved instantly
-        reappear_moved_threshold_px=0.06 * diag,  # distance for gap-reappear trigger
-        fast_move_px=0.08 * diag          # optional “jerk” immediate trigger
+        stable_radius_px=0.02 * diag,      # jitter band near cradle
+        stable_confirm_s=2.0,               # time to lock initial cradle
+        moved_threshold_px=0.06 * diag,     # continuous away threshold
+        moved_min_duration_s=0.30,          # continuous away duration
+        rest_min_duration_s=0.8,            # rest dwell to adopt new cradle
+        gap_min_absent_s=0.10,              # if missing >= this and reappear far -> moved
+        reappear_moved_threshold_px=0.06 * diag,
+        fast_move_px=0.08 * diag            # optional jerk trigger
     )
     bc_decider = BarcodeDecider(rearm_gap_s=2.0)
 
@@ -236,8 +287,17 @@ def main(
 
     next_write_t = 0.0
     write_dt = 1.0 / max(0.1, float(out_fps))
-    active_overlays = []  # list of {'text','pos','end_t'}
+    active_overlays = []  # transient messages (top-right)
     overlay_duration = float(overlay_secs)
+
+    # Persistent counters
+    counts = {
+        "customers": 0,
+        "barcode": 0,
+        "transactions_total": 0,
+        "cash": 0,
+        "card": 0,
+    }
 
     orig_idx = 0
     try:
@@ -309,24 +369,28 @@ def main(
                 st = (start_wallclock + timedelta(seconds=t_now)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
                 writer.writerow([evt_type, lid, vt, st, orig_idx, note])
 
-            # ---- Events -> CSV + Overlays ----
+            # ---- Events -> CSV + Overlays + COUNTS ----
             for e in at_counter_events:
                 _log(e["type"], e["lid"])
                 if e["type"] == "customer_at_counter":
-                    add_overlay(active_overlays, f"CUSTOMER AT COUNTER (L{e['lid']})", "tl", t_now, overlay_duration)
-                # For employees you can also overlay if desired:
-                # elif e["type"] == "employee_at_counter":
-                #     add_overlay(active_overlays, f"EMPLOYEE AT COUNTER (L{e['lid']})", "tl", t_now, overlay_duration)
+                    counts["customers"] += 1
+                    # Move this to top-right (with others)
+                    add_overlay(active_overlays, f"CUSTOMER AT COUNTER (L{e['lid']})", "tr", t_now, overlay_duration)
 
             for e in bc_events:
                 _log(e["type"], e["lid"])
+                counts["barcode"] += 1
                 add_overlay(active_overlays, "BARCODE GUN USED", "tr", t_now, overlay_duration)
 
             for e in tx_events:
                 _log(e["type"], e["lid"])
                 if e["type"] == "card_transaction":
+                    counts["card"] += 1
+                    counts["transactions_total"] += 1
                     add_overlay(active_overlays, "CARD TRANSACTION", "tr", t_now, overlay_duration)
                 elif e["type"] == "cash_transaction":
+                    counts["cash"] += 1
+                    counts["transactions_total"] += 1
                     add_overlay(active_overlays, "CASH TRANSACTION", "tr", t_now, overlay_duration)
 
             # ---- Draw tracks and other boxes ----
@@ -354,7 +418,8 @@ def main(
                 if bpc and bcc:
                     cv2.line(frame, (int(bpc[0]), int(bpc[1])), (int(bcc[0]), int(bcc[1])), (0, 128, 255), 2)
 
-            # Overlays last
+            # ---- Draw persistent HUD (top-left) and transient banners (top-right) ----
+            draw_counter_hud(frame, counts, width)
             draw_overlays(frame, active_overlays, t_now, width)
 
             # ---- Output ----
@@ -383,9 +448,9 @@ if __name__ == "__main__":
     parser.add_argument("video_path")
     parser.add_argument("--weights", default="models/weights.pt", help="Path to YOLO weights")
     parser.add_argument("--conf", type=float, default=0.45, help="YOLO confidence threshold")
-    parser.add_argument("--tracker", type=str, default="tracker/botsort_custom.yaml",
+    parser.add_argument("--tracker", type=str, default="trackers/botsort_counter.yaml",
                         help="Path or name of tracker yaml (path preferred).")
-    parser.add_argument("--out-fps", type=float, default=20.0, help="Output video FPS")
+    parser.add_argument("--out-fps", type=float, default=24.0, help="Output video FPS")
     parser.add_argument("--overlay-secs", type=float, default=2.0, help="Overlay banner duration in seconds")
     parser.add_argument("--no-viz-anchors", action="store_true", help="Disable anchor/line visualization")
     args = parser.parse_args()
